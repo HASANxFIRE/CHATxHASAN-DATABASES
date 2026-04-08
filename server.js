@@ -1,181 +1,220 @@
 const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
 const sqlite3 = require('sqlite3').verbose();
-const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const multer = require('multer');
+const bcrypt = require('bcryptjs');
 const cors = require('cors');
+const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const { v4: uuidv4 } = require('uuid');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const SECRET = 'chatxhasan-super-secret-2026';
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: "*" } });
 
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // Uploads folder
-const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-app.use('/uploads', express.static(uploadDir));
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
+app.use('/uploads', express.static(uploadsDir));
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
+  destination: (req, file, cb) => cb(null, uploadsDir),
   filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname)
 });
 const upload = multer({ storage });
 
+// JWT
+const JWT_SECRET = process.env.JWT_SECRET || 'your-super-secret-key-12345-change-it';
+
 // Database
-const db = new sqlite3.Database('./chatxhasan.db');
+const db = new sqlite3.Database('./chat.db');
 
 db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT UNIQUE NOT NULL,
+    password TEXT NOT NULL,
     first_name TEXT NOT NULL,
     last_name TEXT NOT NULL,
-    email TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    profile_photo TEXT DEFAULT 'https://picsum.photos/id/64/200/200',
-    last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  )`);
-
-  db.run(`CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id TEXT NOT NULL,
-    is_group INTEGER DEFAULT 0,
-    sender_id INTEGER NOT NULL,
-    content TEXT,
-    file_url TEXT,
-    file_type TEXT DEFAULT 'text',
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-    reply_to INTEGER,
-    reactions TEXT DEFAULT '[]'
+    profile_photo TEXT DEFAULT 'https://via.placeholder.com/150?text=Avatar'
   )`);
 
   db.run(`CREATE TABLE IF NOT EXISTS groups (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
-    photo TEXT,
-    created_by INTEGER,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    photo TEXT DEFAULT 'https://via.placeholder.com/150?text=Group',
+    created_by INTEGER NOT NULL
   )`);
 
   db.run(`CREATE TABLE IF NOT EXISTS group_members (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     group_id INTEGER,
-    user_id INTEGER,
-    PRIMARY KEY (group_id, user_id)
+    user_id INTEGER
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender_id INTEGER,
+    receiver_id INTEGER,
+    group_id INTEGER,
+    message_text TEXT,
+    message_type TEXT DEFAULT 'text',
+    file_url TEXT,
+    reply_to INTEGER,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 });
 
+// Auth middleware
 const authenticateToken = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
-  if (!token) return res.sendStatus(401);
-  jwt.verify(token, SECRET, (err, user) => {
-    if (err) return res.sendStatus(403);
+  if (!token) return res.status(401).json({ error: 'No token' });
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) return res.status(403).json({ error: 'Invalid token' });
     req.user = user;
     next();
   });
 };
 
+// Socket auth
+io.use((socket, next) => {
+  const token = socket.handshake.auth.token;
+  if (!token) return next(new Error('Authentication error'));
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) return next(new Error('Authentication error'));
+    socket.user = user;
+    next();
+  });
+});
+
+// ==================== ROUTES ====================
+
 // Register
 app.post('/register', async (req, res) => {
-  const { first_name, last_name, email, password } = req.body;
-  const hash = await bcrypt.hash(password, 10);
-  db.run('INSERT INTO users (first_name, last_name, email, password_hash) VALUES (?,?,?,?)',
-    [first_name, last_name, email, hash], function(err) {
-      if (err) return res.status(400).json({error: err.message});
-      const token = jwt.sign({id: this.lastID, email}, SECRET);
-      res.json({success: true, token, user: {id: this.lastID, first_name, last_name, email, profile_photo: 'https://picsum.photos/id/64/200/200'}});
+  const { email, password, first_name, last_name } = req.body;
+  const hashed = await bcrypt.hash(password, 10);
+  db.run(`INSERT INTO users (email, password, first_name, last_name) VALUES (?,?,?,?)`,
+    [email, hashed, first_name, last_name], function (err) {
+      if (err) return res.status(400).json({ error: err.message });
+      res.json({ success: true, user_id: this.lastID });
     });
 });
 
 // Login
 app.post('/login', async (req, res) => {
   const { email, password } = req.body;
-  db.get('SELECT * FROM users WHERE email=?', [email], async (err, user) => {
-    if (err || !user || !(await bcrypt.compare(password, user.password_hash))) return res.status(401).json({error: 'Invalid credentials'});
-    db.run('UPDATE users SET last_active = CURRENT_TIMESTAMP WHERE id=?', [user.id]);
-    const token = jwt.sign({id: user.id, email: user.email}, SECRET);
-    res.json({success: true, token, user: {id: user.id, first_name: user.first_name, last_name: user.last_name, profile_photo: user.profile_photo}});
+  db.get(`SELECT * FROM users WHERE email = ?`, [email], async (err, user) => {
+    if (err || !user || !(await bcrypt.compare(password, user.password))) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    const token = jwt.sign({ id: user.id, first_name: user.first_name, last_name: user.last_name }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ success: true, token, user: { id: user.id, first_name: user.first_name, last_name: user.last_name, profile_photo: user.profile_photo } });
   });
 });
 
 // Upload profile photo
 app.post('/upload-profile', authenticateToken, upload.single('photo'), (req, res) => {
-  if (!req.file) return res.status(400).json({error: 'No file'});
+  if (!req.file) return res.status(400).json({ error: 'No file' });
   const url = `/uploads/${req.file.filename}`;
-  db.run('UPDATE users SET profile_photo=? WHERE id=?', [url, req.user.id], () => {
-    res.json({success: true, profile_photo: url});
+  db.run(`UPDATE users SET profile_photo = ? WHERE id = ?`, [url, req.user.id]);
+  res.json({ success: true, profile_photo: url });
+});
+
+// Get all users (for Active Users & Personal Chat list)
+app.get('/users', authenticateToken, (req, res) => {
+  db.all(`SELECT id, first_name, last_name, profile_photo FROM users WHERE id != ?`, [req.user.id], (err, users) => {
+    res.json(users);
   });
 });
 
-// Active users
-app.get('/active-users', authenticateToken, (req, res) => {
-  db.all(`SELECT id, first_name, last_name, profile_photo,
-          CASE WHEN last_active > datetime('now', '-5 minutes') THEN 1 ELSE 0 END as is_active 
-          FROM users WHERE id != ?`, [req.user.id], (err, rows) => res.json(rows));
-});
-
-// Send message (text + file)
-app.post('/send-message', authenticateToken, upload.single('file'), (req, res) => {
-  const { chat_id, content, is_group = 0, reply_to } = req.body;
-  let file_url = null, file_type = 'text';
-  if (req.file) {
-    file_url = `/uploads/${req.file.filename}`;
-    const mime = req.file.mimetype;
-    if (mime.startsWith('image')) file_type = 'image';
-    else if (mime.startsWith('video')) file_type = 'video';
-    else if (mime.includes('audio')) file_type = 'voice';
-    else file_type = 'file';
-  }
-  db.run(`INSERT INTO messages (chat_id, is_group, sender_id, content, file_url, file_type, reply_to) 
-          VALUES (?,?,?,?,?,?,?)`, [chat_id, is_group, req.user.id, content || '', file_url, file_type, reply_to || null],
-    function(err) {
-      if (err) return res.status(500).json({error: err.message});
-      res.json({success: true, message_id: this.lastID});
-    });
-});
-
-// Get messages (polling – live chat)
-app.get('/messages/:chat_id', authenticateToken, (req, res) => {
-  const last_id = req.query.last_id || 0;
-  db.all('SELECT * FROM messages WHERE chat_id=? AND id > ? ORDER BY timestamp ASC',
-    [req.params.chat_id, last_id], (err, rows) => res.json(rows));
-});
-
-// Reaction
-app.post('/react', authenticateToken, (req, res) => {
-  const { message_id, reaction } = req.body;
-  db.get('SELECT reactions FROM messages WHERE id=?', [message_id], (err, row) => {
-    if (err || !row) return res.status(404).json({error: 'Not found'});
-    let reactions = JSON.parse(row.reactions || '[]');
-    if (!reactions.includes(reaction)) reactions.push(reaction);
-    db.run('UPDATE messages SET reactions=? WHERE id=?', [JSON.stringify(reactions), message_id], () => res.json({success: true}));
-  });
-});
-
-// Create group
+// Create Group
 app.post('/create-group', authenticateToken, (req, res) => {
-  const { name, members = [] } = req.body;
-  db.run('INSERT INTO groups (name, created_by) VALUES (?,?)', [name, req.user.id], function(err) {
-    if (err) return res.status(500).json({error: err.message});
-    const group_id = this.lastID;
-    const stmt = db.prepare('INSERT INTO group_members (group_id, user_id) VALUES (?,?)');
-    stmt.run(group_id, req.user.id);
-    members.forEach(id => { if (id != req.user.id) stmt.run(group_id, id); });
-    stmt.finalize();
-    res.json({success: true, group_id});
+  const { name, members } = req.body; // members = array of user ids
+  db.run(`INSERT INTO groups (name, created_by) VALUES (?,?)`, [name, req.user.id], function (err) {
+    const groupId = this.lastID;
+    db.run(`INSERT INTO group_members (group_id, user_id) VALUES (?,?)`, [groupId, req.user.id]);
+    if (members && members.length) {
+      const stmt = db.prepare(`INSERT INTO group_members (group_id, user_id) VALUES (?,?)`);
+      members.forEach(id => { if (id !== req.user.id) stmt.run(groupId, id); });
+      stmt.finalize();
+    }
+    res.json({ success: true, group_id: groupId });
   });
 });
 
-// My chats & groups
-app.get('/my-chats', authenticateToken, (req, res) => {
-  db.all(`SELECT g.id as chat_id, g.name, g.photo, 1 as is_group,
-          (SELECT content FROM messages WHERE chat_id = g.id ORDER BY timestamp DESC LIMIT 1) as last_message
-          FROM groups g JOIN group_members gm ON g.id=gm.group_id WHERE gm.user_id=?`, [req.user.id],
-    (err, groups) => res.json({groups, personal: []})); // personal chat_id = p{min}_{max}
+// Get My Groups
+app.get('/groups', authenticateToken, (req, res) => {
+  db.all(`SELECT g.id, g.name, g.photo FROM groups g JOIN group_members gm ON g.id = gm.group_id WHERE gm.user_id = ?`, [req.user.id], (err, groups) => {
+    res.json(groups);
+  });
 });
 
-app.listen(PORT, () => console.log(`CHATxHASAN Server running on ${PORT}`));
+// Get messages (personal or group)
+app.get('/messages/:type/:id', authenticateToken, (req, res) => {
+  const { type, id } = req.params;
+  let sql, params;
+  if (type === 'personal') {
+    sql = `SELECT * FROM messages WHERE (sender_id=? AND receiver_id=?) OR (sender_id=? AND receiver_id=?) ORDER BY timestamp ASC`;
+    params = [req.user.id, parseInt(id), parseInt(id), req.user.id];
+  } else {
+    sql = `SELECT * FROM messages WHERE group_id=? ORDER BY timestamp ASC`;
+    params = [parseInt(id)];
+  }
+  db.all(sql, params, (err, msgs) => res.json(msgs));
+});
+
+// Upload any file (photo, video, voice, file)
+app.post('/upload-file', authenticateToken, upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file' });
+  res.json({ success: true, file_url: `/uploads/${req.file.filename}` });
+});
+
+// ==================== LIVE CHAT (Socket.io) ====================
+io.on('connection', (socket) => {
+  console.log('User connected:', socket.user.id);
+
+  socket.on('join-room', (room) => {
+    socket.join(room);
+  });
+
+  socket.on('send-message', (data) => {
+    const { room, message_text, message_type = 'text', file_url = null, reply_to = null, is_group, target_id } = data;
+    const sender_id = socket.user.id;
+
+    const query = is_group 
+      ? `INSERT INTO messages (sender_id, group_id, message_text, message_type, file_url, reply_to) VALUES (?,?,?,?,?,?)`
+      : `INSERT INTO messages (sender_id, receiver_id, message_text, message_type, file_url, reply_to) VALUES (?,?,?,?,?,?)`;
+
+    const params = is_group 
+      ? [sender_id, target_id, message_text, message_type, file_url, reply_to]
+      : [sender_id, target_id, message_text, message_type, file_url, reply_to];
+
+    db.run(query, params, function (err) {
+      if (err) return;
+      const message = {
+        id: this.lastID,
+        sender_id,
+        receiver_id: is_group ? null : target_id,
+        group_id: is_group ? target_id : null,
+        message_text,
+        message_type,
+        file_url,
+        reply_to,
+        timestamp: new Date().toISOString()
+      };
+      io.to(room).emit('receive-message', message);
+    });
+  });
+
+  socket.on('disconnect', () => {
+    console.log('User disconnected:', socket.user.id);
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`CHATxHASAN Server running on port ${PORT} - SUPER FAST`));
